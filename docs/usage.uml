@@ -1,0 +1,38 @@
+@startuml
+
+
+== Initialization ==
+
+database filesystem as Filesystem
+control main
+boundary "htmplx.NewHandler" as NewHandler
+control "htmplx.Handler" as Handler
+boundary "http.Server" as Server
+
+
+main -> NewHandler
+NewHandler -> Handler
+main <-- Handler : http.Handler
+
+main -> Server : set http.Handler and listen
+
+
+== Handle request ==
+
+actor Client
+
+
+Client -> Server : http request, e.g. GET /path/path2
+Server -> Handler
+Handler -> Handler : check runtime handlers
+alt runtime handler found
+	Server <- Handler : http response
+else no runtime handler found
+	Handler -> Filesystem : look up template(s)
+	Handler <- Filesystem : template(s)
+	Server <- Handler : compiled html
+end
+Client <- Server : http response
+
+
+@enduml

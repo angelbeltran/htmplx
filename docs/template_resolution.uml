@@ -1,0 +1,62 @@
+@startuml
+
+
+actor Client
+boundary "http.Server" as Server
+control "htmplx.Handler" as Handler
+database filesystem as Filesystem
+
+note left
+	omitting asdfasdfasdfasdf
+end note
+
+
+Client -> Server : GET /path1/../pathN
+Server -> Handler 
+Handler -> Filesystem : look up ./body.html.tmpl
+loop in /
+	Handler -> Filesystem : look up all templates
+	Handler <-- Filesystem : /*.html.tmpl files
+	Handler -> Handler : parse templates
+	Handler -> Handler : add templates to available templates
+	note left
+		in parent directories,
+		one can define templates
+		with nested templates to
+		be defined by template
+		files in child directories.
+
+		conversely, on can
+		define templates to be
+		used by templates
+		defined in child
+		directories.
+	end note
+end
+...
+loop in /path1/../pathN
+	Handler -> Filesystem : look up all templates
+	Handler <-- Filesystem : /path1/../pathN/*.html.tmpl files
+	Handler -> Handler : parse templates
+	Handler -> Handler : add templates to available templates
+end
+alt body.html.tmpl is found
+	Handler -> Handler : compile layout template
+	note left
+		layout template requires
+		body.html.tmpl to be defined
+		at the path or one of the
+		parent directories
+
+		head.html.tmpl is expected, 
+		too, but not required
+	end note
+	Server <- Handler : html
+	Client <- Server : http response
+else body.html.tmpl is not found
+	Server <- Handler : 404 not found
+	Client <- Server
+end
+
+
+@enduml
