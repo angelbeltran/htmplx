@@ -7,8 +7,10 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"mime"
 	"net/http"
 	"os"
+	"path"
 	"strings"
 )
 
@@ -44,25 +46,39 @@ func (h *Handler[Data]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	l := slog.With("path", r.URL.Path)
+	l.Debug("handling request")
+	defer l.Debug("request served")
+
 	var pathParts []string
 	if cleanPath := strings.Trim(r.URL.Path, "/"); cleanPath != "" {
 		pathParts = strings.Split(cleanPath, "/")
 	}
 
-	l := slog.With("path", r.URL.Path)
-	l.Debug("handling request")
-	defer l.Debug("request served")
+	rh := requestHandler{
+		fs:  h.fs,
+		log: l,
+	}
+
+	// explicit filenames with file extension should result in a simple file lookup.
+	if ext := path.Ext(r.URL.Path); ext != "" {
+		if ext == ".tmpl" {
+			// templates are not visible
+			rh.notFound(w)
+			return
+		}
+
+		l.Debug("attempting to serve file")
+		rh.serveFile(w, strings.TrimPrefix(r.URL.Path, "/"))
+		return
+	}
 
 	l.Debug("loading templates")
 
-	t, err := requestHandler{
-		fs:  h.fs,
-		log: l,
-	}.loadTemplates(pathParts)
+	t, err := rh.loadTemplates(pathParts)
 	if err != nil {
-		if errors.Is(err, errNotFound) {
-			l.Debug("not found")
-			w.WriteHeader(http.StatusNotFound)
+		if errors.Is(err, fs.ErrNotExist) {
+			rh.notFound(w)
 			return
 		}
 
@@ -92,6 +108,71 @@ type requestHandler struct {
 	log *slog.Logger
 }
 
+func (h requestHandler) serveFile(w http.ResponseWriter, filename string) {
+	f, err := h.fs.Open(filename)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			h.notFound(w)
+		} else {
+			h.internalServerError(w, fmt.Errorf("failed to look up %s: %w", filename, err))
+		}
+		return
+	}
+	defer f.Close()
+
+	h.log.Debug("sniffing content type")
+	contentType := mime.TypeByExtension(path.Ext(filename))
+	h.log.Debug("content type by file extension: " + contentType)
+
+	var bytesRead []byte
+
+	if contentType == "" {
+		contentType, bytesRead, err = h.sniffContentType(f)
+		if err != nil {
+			h.internalServerError(w, fmt.Errorf("failed to read file %s: %w", filename, err))
+			return
+		}
+	}
+
+	h.log = h.log.With("Content-Type", contentType)
+	h.log.Debug("setting Content-Type header")
+	w.Header().Set("Content-Type", contentType)
+	h.log.Debug("writing file to response body")
+	if len(bytesRead) > 0 {
+		w.Write(bytesRead)
+	}
+
+	io.Copy(w, f)
+	h.log.Debug("file served")
+}
+
+func (h requestHandler) sniffContentType(f fs.File) (contentType string, bytesRead []byte, err error) {
+	p := make([]byte, 512)
+	numBytesRead := 0
+
+	for {
+		h.log.Debug("reading bytes up to " + fmt.Sprint(512-numBytesRead) + " bytes")
+		var n int
+		n, err = f.Read(p[numBytesRead:])
+		numBytesRead += n
+		h.log.Debug(fmt.Sprint(n) + " bytes read")
+		h.log.Debug(fmt.Sprint(numBytesRead) + " total bytes read")
+
+		if err != nil || n == 0 || numBytesRead >= len(p) {
+			break
+		}
+	}
+
+	bytesRead = p[:numBytesRead]
+
+	if err == nil || errors.Is(err, io.EOF) {
+		contentType = http.DetectContentType(bytesRead)
+		err = nil
+	}
+
+	return contentType, bytesRead, err
+}
+
 func (h requestHandler) loadTemplates(path []string) (*template.Template, error) {
 	layout, err := layoutTemplate.Clone()
 	if err != nil {
@@ -101,16 +182,16 @@ func (h requestHandler) loadTemplates(path []string) (*template.Template, error)
 	var bodyFound bool
 
 	h.log.Debug("loading head.html.tmpl")
-	if _, err := loadTemplate(layout, h.fs, "head", "head.html.tmpl"); err != nil {
-		if !errors.Is(err, errNotFound) {
+	if _, err := h.loadTemplate(layout, "head", "head.html.tmpl"); err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
 			return nil, err
 		}
 		h.log.Debug("head.html.tmpl not found at root")
 	}
 
 	h.log.Debug("loading body.html.tmpl")
-	if _, err := loadTemplate(layout, h.fs, "body", "body.html.tmpl"); err != nil {
-		if !errors.Is(err, errNotFound) {
+	if _, err := h.loadTemplate(layout, "body", "body.html.tmpl"); err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
 			return nil, err
 		}
 		h.log.Debug("body.html.tmpl not found at root")
@@ -127,25 +208,26 @@ func (h requestHandler) loadTemplates(path []string) (*template.Template, error)
 	}
 
 	if !bodyFound {
-		return nil, fmt.Errorf("%w: no body defined", errNotFound)
+		return nil, fmt.Errorf("%w: no body defined", fs.ErrNotExist)
 	}
 
 	return layout, nil
 }
 
-var errNotFound = fmt.Errorf("not found")
-
-func loadTemplate(t *template.Template, fsys fs.FS, name, path string) (*template.Template, error) {
-	f, err := fsys.Open(path)
+func (h requestHandler) loadTemplate(t *template.Template, name, path string) (*template.Template, error) {
+	b, err := h.readFile(path)
 	if err != nil {
-		var perr *fs.PathError
-		if !errors.As(err, &perr) || !errors.Is(perr.Err, fs.ErrNotExist) {
-			return nil, fmt.Errorf("failed to look up %s: %w", path, err)
-		}
-
-		return nil, errNotFound
+		return nil, err
 	}
 
+	return t.New(name).Parse(string(b))
+}
+
+func (h requestHandler) readFile(path string) ([]byte, error) {
+	f, err := h.fs.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to look up %s: %w", path, err)
+	}
 	defer f.Close()
 
 	b, err := io.ReadAll(f)
@@ -153,7 +235,7 @@ func loadTemplate(t *template.Template, fsys fs.FS, name, path string) (*templat
 		return nil, fmt.Errorf("failed to look up %s: %w", path, err)
 	}
 
-	return t.New(name).Parse(string(b))
+	return b, nil
 }
 
 func (h requestHandler) loadLayoutTemplatesAlongPath(layout *template.Template, fsys fs.FS, path []string) (bodyFound bool, err error) {
@@ -166,13 +248,11 @@ func (h requestHandler) loadLayoutTemplatesAlongPath(layout *template.Template, 
 
 	f, err := fsys.Open(dir)
 	if err != nil {
-		var perr *fs.PathError
-		if !errors.As(err, &perr) || !errors.Is(err, fs.ErrNotExist) {
-			return false, fmt.Errorf("failed to open directory %s: %w", dir, err)
+		if errors.Is(err, fs.ErrNotExist) {
+			h.log.Debug("directory not found")
 		}
 
-		h.log.Debug("directory not found")
-		return false, errNotFound
+		return false, fmt.Errorf("failed to open directory %s: %w", dir, err)
 	}
 	defer f.Close()
 
@@ -256,4 +336,14 @@ func (h requestHandler) loadLayoutTemplatesAlongPath(layout *template.Template, 
 	}
 
 	return bodyFound, nil
+}
+
+func (h requestHandler) notFound(w http.ResponseWriter) {
+	h.log.Debug("not found")
+	w.WriteHeader(http.StatusNotFound)
+}
+
+func (h requestHandler) internalServerError(w http.ResponseWriter, err error) {
+	h.log.With("error", err).Error("internal server error")
+	w.WriteHeader(http.StatusInternalServerError)
 }

@@ -20,7 +20,7 @@
         1. [x] simple filenames
         1. [ ] path patterns
     1. [ ] runtime generated html
-    1. [ ] non-html template assets
+    1. [x] non-html template assets
 1. [ ] Allow devs to escape the htmplx framework
     1. [ ] Check for runtime handlers before return 404.
     1. [ ] ...
