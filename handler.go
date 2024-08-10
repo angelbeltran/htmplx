@@ -45,7 +45,7 @@ type Handler[D RequestData] struct {
 
 func (h *Handler[D]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusNotImplemented)
+		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 
