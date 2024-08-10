@@ -11,36 +11,37 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"regexp"
 	"strings"
 )
 
-func NewHandler[Data any](
+func NewHandler[D RequestData](
 	dir fs.FS,
-	dataFn func(*http.Request) Data,
+	dataFn func(*http.Request) D,
 	funcMapFn func(*http.Request) template.FuncMap,
-) *Handler[Data] {
-	return &Handler[Data]{
+) *Handler[D] {
+	return &Handler[D]{
 		fs:      dir,
 		data:    dataFn,
 		funcMap: funcMapFn,
 	}
 }
 
-func NewHandlerForDirectory[Data any](
+func NewHandlerForDirectory[D RequestData](
 	dir string,
-	dataFn func(*http.Request) Data,
+	dataFn func(*http.Request) D,
 	funcMapFn func(*http.Request) template.FuncMap,
-) *Handler[Data] {
-	return NewHandler[Data](os.DirFS(dir), dataFn, funcMapFn)
+) *Handler[D] {
+	return NewHandler[D](os.DirFS(dir), dataFn, funcMapFn)
 }
 
-type Handler[Data any] struct {
+type Handler[D RequestData] struct {
 	fs      fs.FS
-	data    func(*http.Request) Data
+	data    func(*http.Request) D
 	funcMap func(*http.Request) template.FuncMap
 }
 
-func (h *Handler[Data]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *Handler[D]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusNotImplemented)
 		return
@@ -75,7 +76,7 @@ func (h *Handler[Data]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	l.Debug("loading templates")
 
-	t, err := rh.loadTemplates(pathParts)
+	t, pathExpSubmatches, err := rh.loadTemplates(pathParts)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			rh.notFound(w)
@@ -90,9 +91,10 @@ func (h *Handler[Data]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html")
 
-	var data Data
+	var data D
 	if h.data != nil {
 		data = h.data(r)
+		data.SetPathExpressionSubmatches(pathExpSubmatches)
 	}
 
 	if err := t.Execute(w, data); err != nil {
@@ -173,10 +175,10 @@ func (h requestHandler) sniffContentType(f fs.File) (contentType string, bytesRe
 	return contentType, bytesRead, err
 }
 
-func (h requestHandler) loadTemplates(path []string) (*template.Template, error) {
-	layout, err := layoutTemplate.Clone()
+func (h requestHandler) loadTemplates(path []string) (layout *template.Template, pathExpSubmatches []DirEntryWithSubmatches, err error) {
+	layout, err = layoutTemplate.Clone()
 	if err != nil {
-		return nil, fmt.Errorf("failed to clone layout template: %w", err)
+		return nil, nil, fmt.Errorf("failed to clone layout template: %w", err)
 	}
 
 	var bodyFound bool
@@ -184,7 +186,7 @@ func (h requestHandler) loadTemplates(path []string) (*template.Template, error)
 	h.log.Debug("loading head.html.tmpl")
 	if _, err := h.loadTemplate(layout, "head", "head.html.tmpl"); err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
-			return nil, err
+			return nil, nil, err
 		}
 		h.log.Debug("head.html.tmpl not found at root")
 	}
@@ -192,7 +194,7 @@ func (h requestHandler) loadTemplates(path []string) (*template.Template, error)
 	h.log.Debug("loading body.html.tmpl")
 	if _, err := h.loadTemplate(layout, "body", "body.html.tmpl"); err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
-			return nil, err
+			return nil, nil, err
 		}
 		h.log.Debug("body.html.tmpl not found at root")
 	} else {
@@ -202,16 +204,16 @@ func (h requestHandler) loadTemplates(path []string) (*template.Template, error)
 	if len(path) > 0 {
 		h.log.Debug("loading templates under path")
 		var err error
-		if bodyFound, err = h.loadLayoutTemplatesAlongPath(layout, h.fs, path); err != nil {
-			return nil, err
+		if bodyFound, pathExpSubmatches, err = h.loadLayoutTemplatesAlongPath(layout, h.fs, path); err != nil {
+			return nil, nil, err
 		}
 	}
 
 	if !bodyFound {
-		return nil, fmt.Errorf("%w: no body defined", fs.ErrNotExist)
+		return nil, nil, fmt.Errorf("%w: no body defined", fs.ErrNotExist)
 	}
 
-	return layout, nil
+	return layout, pathExpSubmatches, nil
 }
 
 func (h requestHandler) loadTemplate(t *template.Template, name, path string) (*template.Template, error) {
@@ -238,37 +240,63 @@ func (h requestHandler) readFile(path string) ([]byte, error) {
 	return b, nil
 }
 
-func (h requestHandler) loadLayoutTemplatesAlongPath(layout *template.Template, fsys fs.FS, path []string) (bodyFound bool, err error) {
+func (h requestHandler) loadLayoutTemplatesAlongPath(layout *template.Template, fsys fs.FS, path []string) (bodyFound bool, pathExpSubmatches []DirEntryWithSubmatches, err error) {
 	if len(path) == 0 {
-		return false, nil
+		return false, nil, nil
 	}
 
 	dir := path[0]
 	h.log = h.log.With("directory", dir)
 
-	f, err := fsys.Open(dir)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			h.log.Debug("directory not found")
+	// immediate fail urls with regex path parts so as to not expose regex paths directly
+	if isRegexPathPart(dir) {
+		h.log.Debug("path includes regex: " + dir)
+		return false, nil, fmt.Errorf("%w: path includes regex: %s", fs.ErrNotExist, dir)
+	}
+
+	// find a directory by exact name or one that is a regex matching
+	var dirExpSubmatches DirEntryWithSubmatches
+
+	if info, err := h.stat(fsys, dir); err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return false, nil, fmt.Errorf("failed to check directory %s: %w", dir, err)
 		}
 
-		return false, fmt.Errorf("failed to open directory %s: %w", dir, err)
-	}
-	defer f.Close()
+		h.log.Debug("looking up matching regex directories")
+		matchingDirs, err := h.findMatchingRegexDirs(fsys, dir)
+		if err != nil {
+			return false, nil, err
+		}
+		if len(matchingDirs) == 0 {
+			return false, nil, fmt.Errorf("directory not found: %s: %w", dir, fs.ErrNotExist)
+		}
 
-	info, err := f.Stat()
-	if err != nil {
-		return false, fmt.Errorf("failed to get info on %s: %w", dir, err)
+		for _, d := range matchingDirs {
+			if len(d.Submatches) > len(dirExpSubmatches.Submatches) {
+				dirExpSubmatches = d
+			}
+		}
+
+		h.log.Debug("matching regex directory found: " + dirExpSubmatches.File.Name())
+	} else if !info.IsDir() {
+		return false, nil, fmt.Errorf("%s is not a directory: %w", dir, fs.ErrNotExist)
+	} else {
+		dirExpSubmatches = DirEntryWithSubmatches{
+			File: info,
+		}
 	}
-	if !info.IsDir() {
-		return false, fmt.Errorf("%s is not a directory: %w", dir, err)
-	}
+
+	dir = dirExpSubmatches.File.Name()
+	h.log = h.log.With("directory", dir)
+
+	// gather and compile all template files in the directory
 
 	const htmlTmplExt = ".html.tmpl"
 
 	h.log.Debug("walking directory " + dir)
 
 	var templateFilesFound []string
+
 	if err := fs.WalkDir(fsys, dir, func(path string, e fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -288,27 +316,27 @@ func (h requestHandler) loadLayoutTemplatesAlongPath(layout *template.Template, 
 
 		return nil
 	}); err != nil {
-		return false, fmt.Errorf("failed to look up entries in %s: %w", dir, err)
+		return false, []DirEntryWithSubmatches{dirExpSubmatches}, fmt.Errorf("failed to look up entries in %s: %w", dir, err)
 	}
 
 	rawTemplatesByName := make(map[string][]byte, len(templateFilesFound))
 	for _, filename := range templateFilesFound {
 		templateName := strings.TrimSuffix(filename, htmlTmplExt)
 		if templateName == "" {
-			return false, fmt.Errorf("template file found without name: %s", htmlTmplExt)
+			return false, []DirEntryWithSubmatches{dirExpSubmatches}, fmt.Errorf("template file found without name: %s", htmlTmplExt)
 		}
 
 		relativeFilename := dir + "/" + filename
 
 		f, err := fsys.Open(relativeFilename)
 		if err != nil {
-			return false, fmt.Errorf("failed to open %s: %w", relativeFilename, err)
+			return false, []DirEntryWithSubmatches{dirExpSubmatches}, fmt.Errorf("failed to open %s: %w", relativeFilename, err)
 		}
 		defer f.Close()
 
 		b, err := io.ReadAll(f)
 		if err != nil {
-			return false, fmt.Errorf("failed to read %s: %w", relativeFilename, err)
+			return false, []DirEntryWithSubmatches{dirExpSubmatches}, fmt.Errorf("failed to read %s: %w", relativeFilename, err)
 		}
 
 		rawTemplatesByName[templateName] = b
@@ -317,25 +345,145 @@ func (h requestHandler) loadLayoutTemplatesAlongPath(layout *template.Template, 
 	h.log.Debug("overwriting templates with templates in child directories")
 	for name, b := range rawTemplatesByName {
 		if _, err := layout.New(name).Parse(string(b)); err != nil {
-			return false, fmt.Errorf("failed to parse template %s: %w", name, err)
+			return false, []DirEntryWithSubmatches{dirExpSubmatches}, fmt.Errorf("failed to parse template %s: %w", name, err)
 		}
 	}
 
+	// continue gather templates in the remaining subpath.
+
 	subFsys, err := fs.Sub(fsys, dir)
 	if err != nil {
-		return false, err
+		return false, []DirEntryWithSubmatches{dirExpSubmatches}, err
 	}
-	h.log = h.log.With("subpath", path[1:])
+
+	subpath := path[1:]
+
+	h.log = h.log.With("subpath", subpath)
 	h.log.Debug("loading templates under subpath")
-	if bodyFound, err = h.loadLayoutTemplatesAlongPath(layout, subFsys, path[1:]); err != nil {
-		return bodyFound, err
+
+	var subpathExpSubmatches []DirEntryWithSubmatches
+	bodyFound, subpathExpSubmatches, err = h.loadLayoutTemplatesAlongPath(layout, subFsys, subpath)
+	pathExpSubmatches = append([]DirEntryWithSubmatches{dirExpSubmatches}, subpathExpSubmatches...)
+	if err != nil {
+		return bodyFound, pathExpSubmatches, err
 	}
 
 	if !bodyFound {
 		_, bodyFound = rawTemplatesByName["body"]
 	}
 
-	return bodyFound, nil
+	return bodyFound, pathExpSubmatches, nil
+}
+
+func isRegexPathPart(part string) bool {
+	return len(part) >= 3 && strings.HasPrefix(part, "{") && strings.HasSuffix(part, "}")
+}
+
+func trimRegexPathPart(part string) string {
+	return part[1 : len(part)-1]
+}
+
+func (h requestHandler) stat(fsys fs.FS, dir string) (fs.FileInfo, error) {
+	f, err := fsys.Open(dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			h.log.Debug("directory not found")
+		}
+
+		return nil, fmt.Errorf("failed to open directory: %w", err)
+	}
+	defer f.Close()
+
+	return f.Stat()
+}
+
+func (h requestHandler) findMatchingRegexDirs(fsys fs.FS, exp string) ([]DirEntryWithSubmatches, error) {
+	h.log.Debug("listing directory entries")
+	entries, err := h.listDirEntries(fsys)
+	if err != nil {
+		return nil, fmt.Errorf("failed to look up directory entries: %w", err)
+	}
+
+	h.log = h.log.With("entries", entries)
+	h.log.Debug("directory entries found")
+
+	var matchingEntries []DirEntryWithSubmatches
+
+	for _, e := range entries {
+		name := e.Name()
+
+		if !isRegexPathPart(name) || !e.IsDir() {
+			continue
+		}
+
+		l := h.log.With("entry", e.Name())
+		l.Debug("checking regex directory entry")
+
+		rawRegex := "^" + trimRegexPathPart(name) + "$"
+		l = l.With("expression", rawRegex)
+		l.Debug("compiling expression")
+
+		re, err := regexp.Compile(rawRegex)
+		if err != nil {
+			return nil, fmt.Errorf("invalid regex directory name: %w", err)
+		}
+
+		matches := re.FindStringSubmatch(exp)
+		if matches != nil {
+			l = l.With("matches", matches)
+			l.Debug("matches found")
+
+			info, err := e.Info()
+			if err != nil {
+				return nil, fmt.Errorf("failed to look up file info on file %s: %w", e.Name(), err)
+			}
+
+			subexpNames := re.SubexpNames()[1:]
+			submatches := matches[1:]
+
+			kvs := make([]KeyValuePair, len(submatches))
+			for i, m := range submatches {
+				kvs[i] = KeyValuePair{
+					Key:   subexpNames[i],
+					Value: m,
+				}
+			}
+
+			matchingEntries = append(matchingEntries, DirEntryWithSubmatches{
+				File:       info,
+				Submatches: kvs,
+			})
+		}
+	}
+
+	return matchingEntries, nil
+}
+
+func (h requestHandler) listDirEntries(fsys fs.FS) ([]fs.DirEntry, error) {
+	var entries []fs.DirEntry
+
+	h.log.Debug("walking directory")
+	err := fs.WalkDir(fsys, ".", func(path string, e fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		h.log.Debug("entry: " + e.Name())
+
+		if e.Name() == "." {
+			return nil
+		}
+
+		entries = append(entries, e)
+
+		if e.IsDir() {
+			return fs.SkipDir
+		}
+
+		return nil
+	})
+
+	return entries, err
 }
 
 func (h requestHandler) notFound(w http.ResponseWriter) {
