@@ -255,7 +255,18 @@ func (h requestHandler) readFile(path string) ([]byte, error) {
 
 func (h requestHandler) loadLayoutTemplatesAlongPath(layout *template.Template, fsys fs.FS, path []string) (bodyFound bool, pathExpSubmatches []DirEntryWithSubmatches, err error) {
 	if len(path) == 0 {
-		return false, nil, nil
+		// at the last directory in the path.
+		// handle special cases:
+		// - 404 file means return a 404 Not Found response
+
+		_, err := fs.Stat(fsys, "404")
+		if err == nil {
+			return false, nil, fmt.Errorf("404 file found: %w", fs.ErrNotExist)
+		}
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil, nil
+		}
+		return false, nil, fmt.Errorf("failed to look up 404 file: %w", err)
 	}
 
 	dir := path[0]

@@ -19,6 +19,7 @@
     1. [ ] static files
         1. [x] simple filenames
         1. [x] path patterns
+        1. [x] path mapping to a directory with a '404' file results in a 404 response.
     1. [x] ~~runtime generated html~~
     1. [x] non-html template assets
 1. [ ] Allow devs to escape the htmplx framework
@@ -37,8 +38,6 @@ Those files should be [html go templates](https://pkg.go.dev/html/template).
 
 Each directory corresponding to a valid url must have a body.html.tmpl file or must have one defined
 in a parent directory.
-
-*TODO: define how to return 404 on middle paths*
 
 All incoming http requests will be matched against a directory by http pattern.
 The directory must contain a head.html.tmpl and body.html.tmpl, with some exceptions.
