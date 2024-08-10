@@ -15,30 +15,32 @@ import (
 	"strings"
 )
 
-func NewHandler[D RequestData](
-	dir fs.FS,
-	dataFn func(*http.Request) D,
-	funcMapFn func(*http.Request) template.FuncMap,
-) *Handler[D] {
+func NewHandler[D RequestData](dir fs.FS) *Handler[D] {
 	return &Handler[D]{
-		fs:      dir,
-		data:    dataFn,
-		funcMap: funcMapFn,
+		fs: dir,
 	}
 }
 
-func NewHandlerForDirectory[D RequestData](
-	dir string,
-	dataFn func(*http.Request) D,
-	funcMapFn func(*http.Request) template.FuncMap,
-) *Handler[D] {
-	return NewHandler[D](os.DirFS(dir), dataFn, funcMapFn)
+func NewHandlerForDirectory[D RequestData](dir string) *Handler[D] {
+	return &Handler[D]{
+		fs: os.DirFS(dir),
+	}
+}
+
+func (h *Handler[D]) WithData(data func(*http.Request) D) *Handler[D] {
+	h.data = data
+	return h
+}
+
+func (h *Handler[D]) WithFuncs(funcs func(*http.Request) template.FuncMap) *Handler[D] {
+	h.funcs = funcs
+	return h
 }
 
 type Handler[D RequestData] struct {
-	fs      fs.FS
-	data    func(*http.Request) D
-	funcMap func(*http.Request) template.FuncMap
+	fs    fs.FS
+	data  func(*http.Request) D
+	funcs func(*http.Request) template.FuncMap
 }
 
 func (h *Handler[D]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -74,9 +76,25 @@ func (h *Handler[D]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// load and compile templates
+
+	layout := template.New("layout")
+
+	if h.funcs != nil {
+		layout.Funcs(h.funcs(r))
+	}
+
+	layout, err := layout.Parse(layoutTemplateString)
+	if err != nil {
+		l.With("error", fmt.Errorf("failed to parse layout template: %w", err)).
+			Error("internal server error")
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
 	l.Debug("loading templates")
 
-	t, pathExpSubmatches, err := rh.loadTemplates(pathParts)
+	pathExpSubmatches, err := rh.loadTemplatesOnPath(layout, pathParts)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			rh.notFound(w)
@@ -97,7 +115,7 @@ func (h *Handler[D]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		data.SetPathExpressionSubmatches(pathExpSubmatches)
 	}
 
-	if err := t.Execute(w, data); err != nil {
+	if err := layout.Execute(w, data); err != nil {
 		l.With("error", err).
 			Error("failed to execute template")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -175,18 +193,13 @@ func (h requestHandler) sniffContentType(f fs.File) (contentType string, bytesRe
 	return contentType, bytesRead, err
 }
 
-func (h requestHandler) loadTemplates(path []string) (layout *template.Template, pathExpSubmatches []DirEntryWithSubmatches, err error) {
-	layout, err = layoutTemplate.Clone()
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to clone layout template: %w", err)
-	}
-
+func (h requestHandler) loadTemplatesOnPath(layout *template.Template, path []string) (pathExpSubmatches []DirEntryWithSubmatches, err error) {
 	var bodyFound bool
 
 	h.log.Debug("loading head.html.tmpl")
 	if _, err := h.loadTemplate(layout, "head", "head.html.tmpl"); err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
-			return nil, nil, err
+			return nil, err
 		}
 		h.log.Debug("head.html.tmpl not found at root")
 	}
@@ -194,7 +207,7 @@ func (h requestHandler) loadTemplates(path []string) (layout *template.Template,
 	h.log.Debug("loading body.html.tmpl")
 	if _, err := h.loadTemplate(layout, "body", "body.html.tmpl"); err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
-			return nil, nil, err
+			return nil, err
 		}
 		h.log.Debug("body.html.tmpl not found at root")
 	} else {
@@ -205,15 +218,15 @@ func (h requestHandler) loadTemplates(path []string) (layout *template.Template,
 		h.log.Debug("loading templates under path")
 		var err error
 		if bodyFound, pathExpSubmatches, err = h.loadLayoutTemplatesAlongPath(layout, h.fs, path); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 	}
 
 	if !bodyFound {
-		return nil, nil, fmt.Errorf("%w: no body defined", fs.ErrNotExist)
+		return nil, fmt.Errorf("%w: no body defined", fs.ErrNotExist)
 	}
 
-	return layout, pathExpSubmatches, nil
+	return pathExpSubmatches, nil
 }
 
 func (h requestHandler) loadTemplate(t *template.Template, name, path string) (*template.Template, error) {

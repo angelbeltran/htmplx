@@ -21,18 +21,15 @@ func main() {
 		htmplx.PathExpressionSubmatches
 	}
 
-	h := htmplx.NewHandler(
-		os.DirFS("public"),
-		func(r *http.Request) Data {
+	h := htmplx.NewHandler[Data](os.DirFS("public")).
+		WithData(func(r *http.Request) Data {
 			return Data{
 				URL:                      r.URL,
 				Field1:                   "test data",
 				Field2:                   123,
 				PathExpressionSubmatches: htmplx.PathExpressionSubmatches{},
 			}
-		},
-		nil,
-	)
+		})
 
 	srv := http.Server{
 		Addr:    ":8081",

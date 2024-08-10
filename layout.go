@@ -18,5 +18,6 @@ const (
 )
 
 var (
-	layoutTemplate = template.Must(template.New("layout").Parse(layoutTemplateString))
+	// ensure layout template is valid
+	_ = template.Must(template.New("layout").Parse(layoutTemplateString))
 )
