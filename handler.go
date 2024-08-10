@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -58,6 +59,8 @@ func (h *Handler[D]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		pathParts = strings.Split(cleanPath, "/")
 	}
 
+	l = l.With("pathArray", pathParts)
+
 	rh := requestHandler{
 		fs:  h.fs,
 		log: l,
@@ -94,7 +97,7 @@ func (h *Handler[D]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	l.Debug("loading templates")
 
-	pathExpSubmatches, err := rh.loadTemplatesOnPath(layout, pathParts)
+	pathExpSubmatches, err := rh.loadTemplates(layout, pathParts)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			rh.notFound(w)
@@ -193,7 +196,7 @@ func (h requestHandler) sniffContentType(f fs.File) (contentType string, bytesRe
 	return contentType, bytesRead, err
 }
 
-func (h requestHandler) loadTemplatesOnPath(layout *template.Template, path []string) (pathExpSubmatches []DirEntryWithSubmatches, err error) {
+func (h requestHandler) loadTemplates(layout *template.Template, path []string) (pathExpSubmatches []DirEntryWithSubmatches, err error) {
 	var bodyFound bool
 
 	h.log.Debug("loading head.html.tmpl")
@@ -217,7 +220,7 @@ func (h requestHandler) loadTemplatesOnPath(layout *template.Template, path []st
 	if len(path) > 0 {
 		h.log.Debug("loading templates under path")
 		var err error
-		if bodyFound, pathExpSubmatches, err = h.loadLayoutTemplatesAlongPath(layout, h.fs, path); err != nil {
+		if bodyFound, pathExpSubmatches, err = h.loadTemplatesAlongPath(layout, path); err != nil {
 			return nil, err
 		}
 	}
@@ -253,24 +256,46 @@ func (h requestHandler) readFile(path string) ([]byte, error) {
 	return b, nil
 }
 
-func (h requestHandler) loadLayoutTemplatesAlongPath(layout *template.Template, fsys fs.FS, path []string) (bodyFound bool, pathExpSubmatches []DirEntryWithSubmatches, err error) {
-	if len(path) == 0 {
+func (h requestHandler) loadTemplatesAlongPath(
+	layout *template.Template,
+	path []string,
+) (
+	bodyFound bool,
+	pathExpSubmatches []DirEntryWithSubmatches,
+	err error,
+) {
+	return h.loadTemplatesAlongPathStartingAtIndex(layout, path, 0)
+}
+
+func (h requestHandler) loadTemplatesAlongPathStartingAtIndex(
+	layout *template.Template,
+	path []string,
+	pathIndex int,
+) (
+	bodyFound bool,
+	pathExpSubmatches []DirEntryWithSubmatches,
+	err error,
+) {
+	path = slices.Clone(path)
+	h.log = h.log.With("pathIndex", pathIndex)
+
+	if pathIndex >= len(path) {
 		// at the last directory in the path.
 		// handle special cases:
 		// - 404 file means return a 404 Not Found response
 
-		_, err := fs.Stat(fsys, "404")
-		if err == nil {
-			return false, nil, fmt.Errorf("404 file found: %w", fs.ErrNotExist)
+		h.log.Debug("checking for 404 file")
+		exists, err := h.does404FileExist(path)
+		if err == nil && exists {
+			err = fmt.Errorf("404 file found: %w", fs.ErrNotExist)
 		}
-		if errors.Is(err, fs.ErrNotExist) {
-			return false, nil, nil
-		}
-		return false, nil, fmt.Errorf("failed to look up 404 file: %w", err)
+
+		return false, nil, err
 	}
 
-	dir := path[0]
-	h.log = h.log.With("directory", dir)
+	currentDir := slices.Clone(path[:pathIndex])
+
+	dir := path[pathIndex]
 
 	// immediate fail urls with regex path parts so as to not expose regex paths directly
 	if isRegexPathPart(dir) {
@@ -281,13 +306,13 @@ func (h requestHandler) loadLayoutTemplatesAlongPath(layout *template.Template, 
 	// find a directory by exact name or one that is a regex matching
 	var dirExpSubmatches DirEntryWithSubmatches
 
-	if info, err := h.stat(fsys, dir); err != nil {
+	if info, err := fs.Stat(h.fs, strings.Join(append(currentDir, dir), "/")); err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
 			return false, nil, fmt.Errorf("failed to check directory %s: %w", dir, err)
 		}
 
 		h.log.Debug("looking up matching regex directories")
-		matchingDirs, err := h.findMatchingRegexDirs(fsys, dir)
+		matchingDirs, err := h.findMatchingRegexDirs(strings.Join(currentDir, "/"), dir)
 		if err != nil {
 			return false, nil, err
 		}
@@ -295,13 +320,20 @@ func (h requestHandler) loadLayoutTemplatesAlongPath(layout *template.Template, 
 			return false, nil, fmt.Errorf("directory not found: %s: %w", dir, fs.ErrNotExist)
 		}
 
-		for _, d := range matchingDirs {
+		dirExpSubmatches = matchingDirs[0]
+		for _, d := range matchingDirs[1:] {
 			if len(d.Submatches) > len(dirExpSubmatches.Submatches) {
 				dirExpSubmatches = d
 			}
 		}
 
 		h.log.Debug("matching regex directory found: " + dirExpSubmatches.File.Name())
+
+		dir = dirExpSubmatches.File.Name()
+		path = slices.Clone(path)
+		path[pathIndex] = dir
+
+		h.log = h.log.With("pathRegexMatch", dir)
 	} else if !info.IsDir() {
 		return false, nil, fmt.Errorf("%s is not a directory: %w", dir, fs.ErrNotExist)
 	} else {
@@ -309,9 +341,6 @@ func (h requestHandler) loadLayoutTemplatesAlongPath(layout *template.Template, 
 			File: info,
 		}
 	}
-
-	dir = dirExpSubmatches.File.Name()
-	h.log = h.log.With("directory", dir)
 
 	// gather and compile all template files in the directory
 
@@ -321,11 +350,14 @@ func (h requestHandler) loadLayoutTemplatesAlongPath(layout *template.Template, 
 
 	var templateFilesFound []string
 
-	if err := fs.WalkDir(fsys, dir, func(path string, e fs.DirEntry, err error) error {
+	fullDirName := strings.Join(append(currentDir, dir), "/")
+	if err := fs.WalkDir(h.fs, fullDirName, func(path string, e fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if e.Name() == dir {
+
+		h.log.Debug("file found: " + path)
+		if path == fullDirName {
 			return nil
 		}
 		if e.IsDir() {
@@ -333,8 +365,8 @@ func (h requestHandler) loadLayoutTemplatesAlongPath(layout *template.Template, 
 		}
 
 		name := e.Name()
-		h.log.Debug("template file found: " + name)
 		if strings.HasSuffix(name, htmlTmplExt) {
+			h.log.Debug("template file found: " + name)
 			templateFilesFound = append(templateFilesFound, name)
 		}
 
@@ -343,6 +375,8 @@ func (h requestHandler) loadLayoutTemplatesAlongPath(layout *template.Template, 
 		return false, []DirEntryWithSubmatches{dirExpSubmatches}, fmt.Errorf("failed to look up entries in %s: %w", dir, err)
 	}
 
+	h.log.Debug("templates found: [" + strings.Join(templateFilesFound, ", ") + "]")
+
 	rawTemplatesByName := make(map[string][]byte, len(templateFilesFound))
 	for _, filename := range templateFilesFound {
 		templateName := strings.TrimSuffix(filename, htmlTmplExt)
@@ -350,9 +384,9 @@ func (h requestHandler) loadLayoutTemplatesAlongPath(layout *template.Template, 
 			return false, []DirEntryWithSubmatches{dirExpSubmatches}, fmt.Errorf("template file found without name: %s", htmlTmplExt)
 		}
 
-		relativeFilename := dir + "/" + filename
+		relativeFilename := strings.Join(append(currentDir, dir, filename), "/")
 
-		f, err := fsys.Open(relativeFilename)
+		f, err := h.fs.Open(relativeFilename)
 		if err != nil {
 			return false, []DirEntryWithSubmatches{dirExpSubmatches}, fmt.Errorf("failed to open %s: %w", relativeFilename, err)
 		}
@@ -373,20 +407,10 @@ func (h requestHandler) loadLayoutTemplatesAlongPath(layout *template.Template, 
 		}
 	}
 
-	// continue gather templates in the remaining subpath.
-
-	subFsys, err := fs.Sub(fsys, dir)
-	if err != nil {
-		return false, []DirEntryWithSubmatches{dirExpSubmatches}, err
-	}
-
-	subpath := path[1:]
-
-	h.log = h.log.With("subpath", subpath)
-	h.log.Debug("loading templates under subpath")
+	// continue gather templates in the remaining path.
 
 	var subpathExpSubmatches []DirEntryWithSubmatches
-	bodyFound, subpathExpSubmatches, err = h.loadLayoutTemplatesAlongPath(layout, subFsys, subpath)
+	bodyFound, subpathExpSubmatches, err = h.loadTemplatesAlongPathStartingAtIndex(layout, path, pathIndex+1)
 	pathExpSubmatches = append([]DirEntryWithSubmatches{dirExpSubmatches}, subpathExpSubmatches...)
 	if err != nil {
 		return bodyFound, pathExpSubmatches, err
@@ -399,6 +423,17 @@ func (h requestHandler) loadLayoutTemplatesAlongPath(layout *template.Template, 
 	return bodyFound, pathExpSubmatches, nil
 }
 
+func (h requestHandler) does404FileExist(dir []string) (bool, error) {
+	_, err := fs.Stat(h.fs, strings.Join(append(dir, "404"), "/"))
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	return false, fmt.Errorf("failed to look up 404 file: %w", err)
+}
+
 func isRegexPathPart(part string) bool {
 	return len(part) >= 3 && strings.HasPrefix(part, "{") && strings.HasSuffix(part, "}")
 }
@@ -407,23 +442,9 @@ func trimRegexPathPart(part string) string {
 	return part[1 : len(part)-1]
 }
 
-func (h requestHandler) stat(fsys fs.FS, dir string) (fs.FileInfo, error) {
-	f, err := fsys.Open(dir)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			h.log.Debug("directory not found")
-		}
-
-		return nil, fmt.Errorf("failed to open directory: %w", err)
-	}
-	defer f.Close()
-
-	return f.Stat()
-}
-
-func (h requestHandler) findMatchingRegexDirs(fsys fs.FS, exp string) ([]DirEntryWithSubmatches, error) {
-	h.log.Debug("listing directory entries")
-	entries, err := h.listDirEntries(fsys)
+func (h requestHandler) findMatchingRegexDirs(parentDir, exp string) ([]DirEntryWithSubmatches, error) {
+	h.log.Debug("listing directory entries under " + parentDir)
+	entries, err := h.listDirEntries(parentDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to look up directory entries: %w", err)
 	}
@@ -483,20 +504,23 @@ func (h requestHandler) findMatchingRegexDirs(fsys fs.FS, exp string) ([]DirEntr
 	return matchingEntries, nil
 }
 
-func (h requestHandler) listDirEntries(fsys fs.FS) ([]fs.DirEntry, error) {
+func (h requestHandler) listDirEntries(dirName string) ([]fs.DirEntry, error) {
+	if dirName == "" {
+		dirName = "."
+	}
+
 	var entries []fs.DirEntry
 
-	h.log.Debug("walking directory")
-	err := fs.WalkDir(fsys, ".", func(path string, e fs.DirEntry, err error) error {
+	h.log.Debug("walking directory " + dirName)
+	err := fs.WalkDir(h.fs, dirName, func(path string, e fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-
-		h.log.Debug("entry: " + e.Name())
-
-		if e.Name() == "." {
+		if path == dirName {
 			return nil
 		}
+
+		h.log.Debug("entry: " + path)
 
 		entries = append(entries, e)
 
