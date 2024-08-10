@@ -1,3 +1,6 @@
+[![godoc](http://img.shields.io/badge/godoc-reference-blue.svg?style=flat)](https://pkg.go.dev/github.com/angelbeltran/htmplx)
+
+
 # Work in progress
 
 1. [ ] Design the package
