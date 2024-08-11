@@ -5,7 +5,7 @@ import "html/template"
 const (
 	layoutTemplateString = `{{define "head"}}{{end}}
 {{define "body"}}{{end}}
-<DOCTYPE html>
+<!DOCTYPE html>
 <html>
 	<head>
 		{{ template "head" . }}
