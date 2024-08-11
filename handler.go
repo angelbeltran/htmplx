@@ -1,6 +1,7 @@
 package htmplx
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"html/template"
@@ -54,8 +55,35 @@ func (h *Handler[D]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	l.Debug("handling request")
 	defer l.Debug("request served")
 
+	out, contentType, err := h.ServeFile(r)
+	if err != nil {
+		l.With("error", err).
+			Error("internal server error")
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	if out == nil {
+		l.Warn("not found")
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	io.Copy(w, out)
+}
+
+func (h *Handler[D]) ServeFile(r *http.Request) (
+	out io.Reader,
+	contentType string,
+	err error,
+) {
+
+	urlPath := r.URL.Path
+
+	l := h.log.With("path", urlPath)
+
 	var pathParts []string
-	if cleanPath := strings.Trim(r.URL.Path, "/"); cleanPath != "" {
+	if cleanPath := strings.Trim(urlPath, "/"); cleanPath != "" {
 		pathParts = strings.Split(cleanPath, "/")
 	}
 
@@ -67,16 +95,15 @@ func (h *Handler[D]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// explicit filenames with file extension should result in a simple file lookup.
-	if ext := path.Ext(r.URL.Path); ext != "" {
+	if ext := path.Ext(urlPath); ext != "" {
 		if ext == ".tmpl" {
 			// templates are not visible
-			rh.notFound(w)
-			return
+			return nil, "", nil
 		}
 
 		l.Debug("attempting to serve file")
-		rh.serveFile(w, strings.TrimPrefix(r.URL.Path, "/"))
-		return
+
+		return rh.readFileAndContentType(strings.TrimPrefix(urlPath, "/"))
 	}
 
 	// load and compile templates
@@ -84,15 +111,15 @@ func (h *Handler[D]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	layout := template.New("layout")
 
 	if h.funcs != nil {
-		layout.Funcs(h.funcs(r))
+		layout = layout.Funcs(h.funcs(r))
 	}
 
-	layout, err := layout.Parse(layoutTemplateString)
+	layout, err = layout.Parse(layoutTemplateString)
 	if err != nil {
-		l.With("error", fmt.Errorf("failed to parse layout template: %w", err)).
+		err = fmt.Errorf("failed to parse layout template: %w", err)
+		l.With("error", err).
 			Error("internal server error")
-		w.WriteHeader(http.StatusInternalServerError)
-		return
+		return nil, "", err
 	}
 
 	l.Debug("loading templates")
@@ -100,17 +127,13 @@ func (h *Handler[D]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	pathExpSubmatches, err := rh.loadTemplates(layout, pathParts)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			rh.notFound(w)
-			return
+			return nil, "", nil
 		}
 
 		l.With("error", err).
 			Error("internal server error")
-		w.WriteHeader(http.StatusInternalServerError)
-		return
+		return nil, "", err
 	}
-
-	w.Header().Set("Content-Type", "text/html")
 
 	var data D
 	if h.data != nil {
@@ -118,12 +141,15 @@ func (h *Handler[D]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		data.SetPathExpressionSubmatches(pathExpSubmatches)
 	}
 
-	if err := layout.Execute(w, data); err != nil {
+	var buf bytes.Buffer
+
+	if err := layout.Execute(&buf, data); err != nil {
 		l.With("error", err).
 			Error("failed to execute template")
-		w.WriteHeader(http.StatusInternalServerError)
-		return
+		return nil, "", fmt.Errorf("failed to execute template: %w", err)
 	}
+
+	return &buf, "text/html", nil
 }
 
 type requestHandler struct {
@@ -132,19 +158,43 @@ type requestHandler struct {
 }
 
 func (h requestHandler) serveFile(w http.ResponseWriter, filename string) {
+	f, contentType, err := h.readFileAndContentType(filename)
+	if err != nil {
+		h.internalServerError(w, err)
+		return
+	}
+	if f == nil {
+		h.notFound(w)
+		return
+	}
+
+	h.log = h.log.With("Content-Type", contentType)
+	h.log.Debug("setting Content-Type header")
+	w.Header().Set("Content-Type", contentType)
+	h.log.Debug("writing file to response body")
+
+	io.Copy(w, f)
+	h.log.Debug("file served")
+}
+
+func (h requestHandler) readFileAndContentType(filename string) (
+	out io.Reader,
+	contentType string,
+	err error,
+) {
 	f, err := h.fs.Open(filename)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			h.notFound(w)
+			return nil, "", nil
 		} else {
-			h.internalServerError(w, fmt.Errorf("failed to look up %s: %w", filename, err))
+			return nil, "", fmt.Errorf("failed to look up %s: %w", filename, err)
 		}
 		return
 	}
 	defer f.Close()
 
 	h.log.Debug("sniffing content type")
-	contentType := mime.TypeByExtension(path.Ext(filename))
+	contentType = mime.TypeByExtension(path.Ext(filename))
 	h.log.Debug("content type by file extension: " + contentType)
 
 	var bytesRead []byte
@@ -152,21 +202,23 @@ func (h requestHandler) serveFile(w http.ResponseWriter, filename string) {
 	if contentType == "" {
 		contentType, bytesRead, err = h.sniffContentType(f)
 		if err != nil {
-			h.internalServerError(w, fmt.Errorf("failed to read file %s: %w", filename, err))
-			return
+			return nil, "", fmt.Errorf("failed to read file %s: %w", filename, err)
 		}
 	}
 
-	h.log = h.log.With("Content-Type", contentType)
-	h.log.Debug("setting Content-Type header")
-	w.Header().Set("Content-Type", contentType)
-	h.log.Debug("writing file to response body")
+	var buf bytes.Buffer
+
 	if len(bytesRead) > 0 {
-		w.Write(bytesRead)
+		if _, err := buf.Write(bytesRead); err != nil {
+			return nil, contentType, fmt.Errorf("unexpected error while writing buffer: %w", err)
+		}
 	}
 
-	io.Copy(w, f)
-	h.log.Debug("file served")
+	if _, err := io.Copy(&buf, f); err != nil {
+		return nil, contentType, fmt.Errorf("unexpected error while writing buffer: %w", err)
+	}
+
+	return &buf, contentType, nil
 }
 
 func (h requestHandler) sniffContentType(f fs.File) (contentType string, bytesRead []byte, err error) {
