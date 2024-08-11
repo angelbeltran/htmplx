@@ -28,6 +28,8 @@
 1. [ ] Allow devs to escape the htmplx framework
     1. [x] ~~Check for runtime handlers before return 404.~~
     1. [ ] ...
+1. [ ] HTMX support
+    1. [ ] When given a GET request with the HX-Request, just find and compile the fragment.html.tmpl file at the path.
 
 
 # Usage
