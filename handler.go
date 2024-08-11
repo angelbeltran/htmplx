@@ -18,14 +18,13 @@ import (
 
 func NewHandler[D RequestData](dir fs.FS) *Handler[D] {
 	return &Handler[D]{
-		fs: dir,
+		log: newLogger(),
+		fs:  dir,
 	}
 }
 
 func NewHandlerForDirectory[D RequestData](dir string) *Handler[D] {
-	return &Handler[D]{
-		fs: os.DirFS(dir),
-	}
+	return NewHandler[D](os.DirFS(dir))
 }
 
 func (h *Handler[D]) WithData(data func(*http.Request) D) *Handler[D] {
@@ -39,6 +38,7 @@ func (h *Handler[D]) WithFuncs(funcs func(*http.Request) template.FuncMap) *Hand
 }
 
 type Handler[D RequestData] struct {
+	log   *slog.Logger
 	fs    fs.FS
 	data  func(*http.Request) D
 	funcs func(*http.Request) template.FuncMap
@@ -50,7 +50,7 @@ func (h *Handler[D]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	l := slog.With("path", r.URL.Path)
+	l := h.log.With("path", r.URL.Path)
 	l.Debug("handling request")
 	defer l.Debug("request served")
 
