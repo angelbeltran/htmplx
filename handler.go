@@ -149,7 +149,89 @@ func (h *Handler[D]) ServeFile(r *http.Request) (
 		return nil, "", fmt.Errorf("failed to execute template: %w", err)
 	}
 
-	return &buf, "text/html", nil
+	return &buf, "text/html; charset=utf-8", nil
+}
+
+// TODO: merge common code with ServeFile
+
+func (h *Handler[D]) ServeFragment(r *http.Request) (
+	out io.Reader,
+	contentType string,
+	err error,
+) {
+
+	urlPath := r.URL.Path
+
+	l := h.log.With("path", urlPath)
+
+	var pathParts []string
+	if cleanPath := strings.Trim(urlPath, "/"); cleanPath != "" {
+		pathParts = strings.Split(cleanPath, "/")
+	}
+
+	l = l.With("pathArray", pathParts)
+
+	rh := requestHandler{
+		fs:  h.fs,
+		log: l,
+	}
+
+	// explicit filenames with file extension should result in a simple file lookup.
+	if ext := path.Ext(urlPath); ext != "" {
+		if ext == ".tmpl" {
+			// templates are not visible
+			return nil, "", nil
+		}
+
+		l.Debug("attempting to serve file")
+
+		return rh.readFileAndContentType(strings.TrimPrefix(urlPath, "/"))
+	}
+
+	// load and compile templates
+
+	layout := template.New("fragment")
+
+	if h.funcs != nil {
+		layout = layout.Funcs(h.funcs(r))
+	}
+
+	layout, err = layout.Parse(fragmentTemplateString)
+	if err != nil {
+		err = fmt.Errorf("failed to parse layout template: %w", err)
+		l.With("error", err).
+			Error("internal server error")
+		return nil, "", err
+	}
+
+	l.Debug("loading templates")
+
+	pathExpSubmatches, err := rh.loadFragmentTemplates(layout, pathParts)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, "", nil
+		}
+
+		l.With("error", err).
+			Error("internal server error")
+		return nil, "", err
+	}
+
+	var data D
+	if h.data != nil {
+		data = h.data(r)
+		data.SetPathExpressionSubmatches(pathExpSubmatches)
+	}
+
+	var buf bytes.Buffer
+
+	if err := layout.Execute(&buf, data); err != nil {
+		l.With("error", err).
+			Error("failed to execute template")
+		return nil, "", fmt.Errorf("failed to execute template: %w", err)
+	}
+
+	return &buf, "text/html; charset=utf-8", nil
 }
 
 type requestHandler struct {
@@ -258,6 +340,34 @@ func (h requestHandler) loadTemplates(layout *template.Template, path []string) 
 		}
 		h.log.Debug("head.html.tmpl not found at root")
 	}
+
+	h.log.Debug("loading body.html.tmpl")
+	if _, err := h.loadTemplate(layout, "body", "body.html.tmpl"); err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return nil, err
+		}
+		h.log.Debug("body.html.tmpl not found at root")
+	} else {
+		bodyFound = true
+	}
+
+	if len(path) > 0 {
+		h.log.Debug("loading templates under path")
+		var err error
+		if bodyFound, pathExpSubmatches, err = h.loadTemplatesAlongPath(layout, path); err != nil {
+			return nil, err
+		}
+	}
+
+	if !bodyFound {
+		return nil, fmt.Errorf("%w: no body defined", fs.ErrNotExist)
+	}
+
+	return pathExpSubmatches, nil
+}
+
+func (h requestHandler) loadFragmentTemplates(layout *template.Template, path []string) (pathExpSubmatches []DirEntryWithSubmatches, err error) {
+	var bodyFound bool
 
 	h.log.Debug("loading body.html.tmpl")
 	if _, err := h.loadTemplate(layout, "body", "body.html.tmpl"); err != nil {
@@ -513,7 +623,8 @@ func (h requestHandler) findMatchingRegexDirs(parentDir, exp string) ([]DirEntry
 			continue
 		}
 
-		l := h.log.With("entry", e.Name())
+		l := h.log.With("entry", e.Name()).
+			With("dir", exp)
 		l.Debug("checking regex directory entry")
 
 		rawRegex := "^" + trimRegexPathPart(name) + "$"
@@ -525,6 +636,7 @@ func (h requestHandler) findMatchingRegexDirs(parentDir, exp string) ([]DirEntry
 			return nil, fmt.Errorf("invalid regex directory name: %w", err)
 		}
 
+		l.Debug("checking expression against path")
 		matches := re.FindStringSubmatch(exp)
 		if matches != nil {
 			l = l.With("matches", matches)
